@@ -1,26 +1,26 @@
 import os
 import uuid
 import json
+import html
 import tempfile
 from pathlib import Path
 from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 from groq import Groq
 from faster_whisper import WhisperModel
-from TTS.api import TTS
 
 st.set_page_config(
-    page_title="Voice AI Assistant",
+    page_title="Voice-to-Voice AI",
     page_icon="🎤",
     layout="wide",
 )
 
-APP_TITLE = "🎤 Voice AI Assistant"
-APP_SUBTITLE = "Streamlit + Groq + Faster-Whisper + Coqui TTS"
+APP_TITLE = "🎤 Voice-to-Voice AI Assistant"
+APP_SUBTITLE = "Streamlit + Faster-Whisper + Groq + Browser Voice Output"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 WHISPER_MODEL_SIZE = "small"
-TTS_MODEL_NAME = "tts_models/en/ljspeech/tacotron2-DDC"
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "streamlit_voice_ai_app"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -28,7 +28,8 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 SYSTEM_PROMPT = """
 You are a helpful AI voice assistant.
 Reply clearly, naturally, and concisely.
-Keep answers easy to understand when read aloud.
+Keep answers easy to understand when spoken aloud.
+Prefer short paragraphs.
 """.strip()
 
 
@@ -60,14 +61,8 @@ def load_whisper_model(model_size: str):
     )
 
 
-@st.cache_resource
-def load_tts_model():
-    return TTS(model_name=TTS_MODEL_NAME, progress_bar=False)
-
-
 client = load_groq_client()
 whisper_model = load_whisper_model(WHISPER_MODEL_SIZE)
-tts_model = load_tts_model()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -78,11 +73,8 @@ if "last_transcript" not in st.session_state:
 if "last_response" not in st.session_state:
     st.session_state.last_response = ""
 
-if "last_audio_path" not in st.session_state:
-    st.session_state.last_audio_path = ""
-
-if "processing_error" not in st.session_state:
-    st.session_state.processing_error = ""
+if "auto_speak" not in st.session_state:
+    st.session_state.auto_speak = True
 
 
 def save_uploaded_audio(uploaded_audio) -> str:
@@ -102,13 +94,13 @@ def transcribe_audio(audio_path: str) -> str:
         vad_filter=True,
     )
 
-    transcript_parts = []
+    parts = []
     for segment in segments:
         text = segment.text.strip()
         if text:
-            transcript_parts.append(text)
+            parts.append(text)
 
-    return " ".join(transcript_parts).strip()
+    return " ".join(parts).strip()
 
 
 def build_groq_messages(user_text: str):
@@ -137,15 +129,6 @@ def ask_groq(user_text: str) -> str:
     return chat_completion.choices[0].message.content.strip()
 
 
-def synthesize_speech(text: str) -> str:
-    output_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
-    tts_model.tts_to_file(
-        text=text,
-        file_path=str(output_path),
-    )
-    return str(output_path)
-
-
 def add_user_message(text: str):
     st.session_state.messages.append(
         {
@@ -170,15 +153,10 @@ def clear_chat():
     st.session_state.messages = []
     st.session_state.last_transcript = ""
     st.session_state.last_response = ""
-    st.session_state.last_audio_path = ""
-    st.session_state.processing_error = ""
 
 
 def export_chat_as_text() -> str:
-    lines = []
-    lines.append("Voice AI Assistant Chat Export")
-    lines.append("=" * 40)
-
+    lines = ["Voice AI Assistant Chat Export", "=" * 40]
     for msg in st.session_state.messages:
         role = msg.get("role", "unknown").upper()
         time = msg.get("time", "")
@@ -186,7 +164,6 @@ def export_chat_as_text() -> str:
         lines.append(f"[{time}] {role}:")
         lines.append(content)
         lines.append("")
-
     return "\n".join(lines)
 
 
@@ -200,10 +177,7 @@ def process_user_text(user_text: str):
         st.warning("Please enter some text.")
         return
 
-    st.session_state.processing_error = ""
     st.session_state.last_transcript = cleaned
-    st.session_state.last_audio_path = ""
-
     add_user_message(cleaned)
 
     with st.spinner("Thinking with Groq..."):
@@ -212,18 +186,11 @@ def process_user_text(user_text: str):
     st.session_state.last_response = assistant_reply
     add_assistant_message(assistant_reply)
 
-    with st.spinner("Generating voice output..."):
-        audio_path = synthesize_speech(assistant_reply)
-
-    st.session_state.last_audio_path = audio_path
-
 
 def process_audio_input(uploaded_audio):
     if uploaded_audio is None:
         st.warning("Please record audio first.")
         return
-
-    st.session_state.processing_error = ""
 
     try:
         with st.spinner("Saving audio..."):
@@ -237,7 +204,6 @@ def process_audio_input(uploaded_audio):
             return
 
         st.session_state.last_transcript = transcript
-        st.session_state.last_audio_path = ""
         add_user_message(transcript)
 
         with st.spinner("Thinking with Groq..."):
@@ -246,21 +212,88 @@ def process_audio_input(uploaded_audio):
         st.session_state.last_response = assistant_reply
         add_assistant_message(assistant_reply)
 
-        with st.spinner("Generating voice output..."):
-            assistant_audio_path = synthesize_speech(assistant_reply)
-
-        st.session_state.last_audio_path = assistant_audio_path
-
     except Exception as e:
-        st.session_state.processing_error = str(e)
         st.error(f"Error: {e}")
+
+
+def speak_text_browser(text: str, auto_play: bool = True):
+    if not text:
+        return
+
+    safe_text = html.escape(text)
+    autoplay_js = "speakNow();" if auto_play else ""
+
+    components.html(
+        f"""
+        <div style="padding: 0.5rem 0;">
+            <button onclick="speakNow()" style="
+                background:#16a34a;
+                color:white;
+                border:none;
+                padding:10px 16px;
+                border-radius:8px;
+                cursor:pointer;
+                font-size:14px;
+            ">
+                🔊 Play Voice Reply
+            </button>
+
+            <button onclick="stopSpeak()" style="
+                background:#dc2626;
+                color:white;
+                border:none;
+                padding:10px 16px;
+                border-radius:8px;
+                cursor:pointer;
+                font-size:14px;
+                margin-left:8px;
+            ">
+                ⏹ Stop
+            </button>
+        </div>
+
+        <script>
+            const replyText = `{safe_text}`;
+
+            function speakNow() {{
+                window.speechSynthesis.cancel();
+                const utterance = new SpeechSynthesisUtterance(replyText);
+                utterance.rate = 1.0;
+                utterance.pitch = 1.0;
+                utterance.volume = 1.0;
+                const voices = window.speechSynthesis.getVoices();
+
+                const preferred =
+                    voices.find(v => v.lang && v.lang.toLowerCase().startsWith("en")) ||
+                    voices[0];
+
+                if (preferred) {{
+                    utterance.voice = preferred;
+                }}
+
+                window.speechSynthesis.speak(utterance);
+            }}
+
+            function stopSpeak() {{
+                window.speechSynthesis.cancel();
+            }}
+
+            {autoplay_js}
+        </script>
+        """,
+        height=80,
+    )
 
 
 with st.sidebar:
     st.header("⚙️ Settings")
     st.write(f"**Groq model:** `{GROQ_MODEL}`")
     st.write(f"**Whisper model:** `{WHISPER_MODEL_SIZE}`")
-    st.write(f"**TTS model:** `{TTS_MODEL_NAME}`")
+
+    st.session_state.auto_speak = st.toggle(
+        "Auto play voice reply",
+        value=st.session_state.auto_speak,
+    )
 
     st.divider()
 
@@ -335,17 +368,12 @@ with col2:
     else:
         st.caption("No response generated yet.")
 
-if st.session_state.last_audio_path:
+if st.session_state.last_response:
     st.subheader("🔊 Voice Output")
-    st.audio(st.session_state.last_audio_path)
-
-    with open(st.session_state.last_audio_path, "rb") as f:
-        st.download_button(
-            label="⬇️ Download Voice Reply",
-            data=f,
-            file_name="assistant_reply.wav",
-            mime="audio/wav",
-        )
+    speak_text_browser(
+        st.session_state.last_response,
+        auto_play=st.session_state.auto_speak,
+    )
 
 st.divider()
 st.subheader("Conversation")

@@ -3,98 +3,127 @@ import uuid
 import tempfile
 from pathlib import Path
 
-import gradio as gr
-import soundfile as sf
-from dotenv import load_dotenv
+import streamlit as st
 from groq import Groq
 from faster_whisper import WhisperModel
 from TTS.api import TTS
 
-load_dotenv()
+# =========================
+# Page Config
+# =========================
+st.set_page_config(page_title="Voice AI App", page_icon="🎤", layout="centered")
 
 # =========================
-# Configuration
+# Load Groq API Key
+# Priority:
+# 1. Streamlit secrets
+# 2. Environment variable
 # =========================
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_API_KEY = None
 
-# Whisper sizes: tiny, base, small, medium, large-v3
-# small/base are lighter, medium gives better quality.
-WHISPER_MODEL_SIZE = "small"
-
-# Coqui TTS model:
-# Simple and reliable English model.
-TTS_MODEL_NAME = "tts_models/en/ljspeech/tacotron2-DDC"
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except Exception:
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY is not set. Add it as an environment variable.")
+    st.error("GROQ_API_KEY not found. Add it in Streamlit secrets.")
+    st.stop()
 
-# Groq client
-client = Groq(api_key=GROQ_API_KEY)
+# =========================
+# Config
+# =========================
+GROQ_MODEL = "llama-3.3-70b-versatile"
+WHISPER_MODEL_SIZE = "small"  # tiny, base, small, medium, large-v3
+TTS_MODEL_NAME = "tts_models/en/ljspeech/tacotron2-DDC"
 
-# Load STT model once
-# device="cpu" works everywhere
-# compute_type="int8" is lighter for CPU
-stt_model = WhisperModel(
-    WHISPER_MODEL_SIZE,
-    device="cpu",
-    compute_type="int8"
-)
+# Temp directory
+TEMP_DIR = Path(tempfile.gettempdir()) / "streamlit_voice_ai"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Load TTS model once
-tts = TTS(model_name=TTS_MODEL_NAME, progress_bar=False)
+# =========================
+# Cached Models
+# =========================
+@st.cache_resource
+def load_groq_client():
+    return Groq(api_key=GROQ_API_KEY)
 
-# Temporary folder for generated audio
-OUTPUT_DIR = Path(tempfile.gettempdir()) / "gradio_groq_voice_app"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+@st.cache_resource
+def load_whisper_model():
+    return WhisperModel(
+        WHISPER_MODEL_SIZE,
+        device="cpu",
+        compute_type="int8"
+    )
 
+@st.cache_resource
+def load_tts_model():
+    return TTS(model_name=TTS_MODEL_NAME, progress_bar=False)
+
+client = load_groq_client()
+whisper_model = load_whisper_model()
+tts_model = load_tts_model()
+
+# =========================
+# Session State
+# =========================
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 # =========================
 # Helper Functions
 # =========================
+def save_uploaded_audio(uploaded_file) -> str:
+    """
+    Save Streamlit uploaded audio to a temp file.
+    """
+    suffix = Path(uploaded_file.name).suffix if uploaded_file.name else ".wav"
+    temp_audio_path = TEMP_DIR / f"{uuid.uuid4().hex}{suffix}"
+
+    with open(temp_audio_path, "wb") as f:
+        f.write(uploaded_file.read())
+
+    return str(temp_audio_path)
+
 def transcribe_audio(audio_path: str) -> str:
     """
-    Convert speech to text using faster-whisper.
+    Speech-to-text using faster-whisper.
     """
-    if not audio_path or not os.path.exists(audio_path):
-        raise ValueError("Audio file not found.")
-
-    segments, info = stt_model.transcribe(
+    segments, info = whisper_model.transcribe(
         audio_path,
         beam_size=5,
         vad_filter=True
     )
-
     transcript = " ".join(segment.text.strip() for segment in segments).strip()
     return transcript
 
-
-def ask_groq(user_text: str, history: list | None = None) -> str:
+def build_messages(user_text: str):
     """
-    Send text to Groq chat completion API.
+    Build Groq messages with history.
     """
-    if not user_text.strip():
-        raise ValueError("Transcript is empty.")
-
     messages = [
         {
             "role": "system",
             "content": (
                 "You are a helpful voice assistant. "
-                "Reply clearly, naturally, and concisely. "
-                "Keep spoken responses easy to understand."
+                "Reply in a natural, concise, and spoken style. "
+                "Keep answers clear and easy to listen to."
             ),
         }
     ]
 
-    if history:
-        for human, assistant in history:
-            if human:
-                messages.append({"role": "user", "content": human})
-            if assistant:
-                messages.append({"role": "assistant", "content": assistant})
+    for item in st.session_state.chat_history:
+        messages.append({"role": "user", "content": item["user"]})
+        messages.append({"role": "assistant", "content": item["assistant"]})
 
     messages.append({"role": "user", "content": user_text})
+    return messages
+
+def ask_groq(user_text: str) -> str:
+    """
+    Get response from Groq.
+    """
+    messages = build_messages(user_text)
 
     chat_completion = client.chat.completions.create(
         messages=messages,
@@ -103,99 +132,91 @@ def ask_groq(user_text: str, history: list | None = None) -> str:
 
     return chat_completion.choices[0].message.content.strip()
 
-
 def synthesize_speech(text: str) -> str:
     """
-    Convert assistant text reply to audio using Coqui TTS.
-    Returns path of generated wav file.
+    Text-to-speech using Coqui TTS.
     """
-    if not text.strip():
-        raise ValueError("Assistant reply is empty.")
-
-    output_path = OUTPUT_DIR / f"{uuid.uuid4().hex}.wav"
-    tts.tts_to_file(text=text, file_path=str(output_path))
-
-    # Optional validation: ensure file is readable
-    data, sr = sf.read(str(output_path))
-    if data is None or len(data) == 0:
-        raise RuntimeError("Generated audio file is empty.")
-
+    output_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
+    tts_model.tts_to_file(text=text, file_path=str(output_path))
     return str(output_path)
 
-
-def process_voice(audio, chat_history):
-    """
-    Full pipeline:
-    1. STT
-    2. Groq LLM
-    3. TTS
-    """
-    if audio is None:
-        return chat_history, "", "", None
-
-    try:
-        user_text = transcribe_audio(audio)
-        assistant_text = ask_groq(user_text, chat_history)
-        assistant_audio = synthesize_speech(assistant_text)
-
-        chat_history = chat_history or []
-        chat_history.append((user_text, assistant_text))
-
-        return chat_history, user_text, assistant_text, assistant_audio
-
-    except Exception as e:
-        error_message = f"Error: {str(e)}"
-        return chat_history, error_message, error_message, None
-
-
-def clear_all():
-    return [], "", "", None
-
-
 # =========================
-# Gradio UI
+# UI
 # =========================
-with gr.Blocks(title="Groq Voice-to-Voice Assistant") as demo:
-    gr.Markdown("# Voice-to-Voice AI Assistant")
-    gr.Markdown(
-        """
-        **Stack**
-        - STT: Faster-Whisper
-        - LLM: Groq (`llama-3.3-70b-versatile`)
-        - TTS: Coqui TTS
+st.title("🎤 Voice-to-Voice AI App")
+st.write("Free open-source STT + TTS with Groq LLM and Streamlit frontend.")
 
-        Record your voice, get a text answer, and hear the spoken response.
+with st.expander("Current Stack", expanded=True):
+    st.markdown(
+        f"""
+        - **STT:** Faster-Whisper (`{WHISPER_MODEL_SIZE}`)
+        - **LLM:** Groq (`{GROQ_MODEL}`)
+        - **TTS:** Coqui TTS (`{TTS_MODEL_NAME}`)
         """
     )
 
-    chatbot = gr.Chatbot(label="Conversation", height=400)
+audio_file = st.audio_input("Record your voice")
 
-    with gr.Row():
-        audio_input = gr.Audio(
-            sources=["microphone", "upload"],
-            type="filepath",
-            label="Speak or upload audio"
-        )
+col1, col2 = st.columns(2)
 
-    with gr.Row():
-        submit_btn = gr.Button("Send", variant="primary")
-        clear_btn = gr.Button("Clear")
+with col1:
+    process_btn = st.button("Process Voice", use_container_width=True)
 
-    transcript_box = gr.Textbox(label="Transcription")
-    response_box = gr.Textbox(label="Assistant Response", lines=6)
-    audio_output = gr.Audio(label="Assistant Voice Response", type="filepath")
+with col2:
+    clear_btn = st.button("Clear Chat", use_container_width=True)
 
-    submit_btn.click(
-        fn=process_voice,
-        inputs=[audio_input, chatbot],
-        outputs=[chatbot, transcript_box, response_box, audio_output]
-    )
+if clear_btn:
+    st.session_state.chat_history = []
+    st.success("Chat cleared.")
 
-    clear_btn.click(
-        fn=clear_all,
-        inputs=[],
-        outputs=[chatbot, transcript_box, response_box, audio_output]
-    )
+if process_btn:
+    if audio_file is None:
+        st.warning("Pehle audio record karo.")
+    else:
+        try:
+            with st.spinner("Saving audio..."):
+                audio_path = save_uploaded_audio(audio_file)
 
-if __name__ == "__main__":
-    demo.launch()
+            st.audio(audio_path)
+
+            with st.spinner("Transcribing with Whisper..."):
+                user_text = transcribe_audio(audio_path)
+
+            st.subheader("Transcription")
+            st.write(user_text if user_text else "_No speech detected._")
+
+            if not user_text:
+                st.warning("Speech detect nahi hui. Dobara try karo.")
+            else:
+                with st.spinner("Getting reply from Groq..."):
+                    assistant_text = ask_groq(user_text)
+
+                st.subheader("Assistant Reply")
+                st.write(assistant_text)
+
+                with st.spinner("Generating voice with Coqui TTS..."):
+                    assistant_audio_path = synthesize_speech(assistant_text)
+
+                st.subheader("Assistant Voice")
+                st.audio(assistant_audio_path)
+
+                st.session_state.chat_history.append(
+                    {
+                        "user": user_text,
+                        "assistant": assistant_text,
+                    }
+                )
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+# =========================
+# Chat History
+# =========================
+if st.session_state.chat_history:
+    st.subheader("Conversation History")
+    for i, item in enumerate(reversed(st.session_state.chat_history), start=1):
+        with st.container():
+            st.markdown(f"**User:** {item['user']}")
+            st.markdown(f"**Assistant:** {item['assistant']}")
+            st.divider()

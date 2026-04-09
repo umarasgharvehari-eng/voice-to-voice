@@ -8,23 +8,19 @@ from datetime import datetime
 import streamlit as st
 from groq import Groq
 from faster_whisper import WhisperModel
+from TTS.api import TTS
 
-# =====================================
-# Page Config
-# =====================================
 st.set_page_config(
     page_title="Voice AI Assistant",
     page_icon="🎤",
     layout="wide",
 )
 
-# =====================================
-# App Constants
-# =====================================
 APP_TITLE = "🎤 Voice AI Assistant"
-APP_SUBTITLE = "Streamlit + Groq + Faster-Whisper (Free Open-Source STT)"
+APP_SUBTITLE = "Streamlit + Groq + Faster-Whisper + Coqui TTS"
 GROQ_MODEL = "llama-3.3-70b-versatile"
-WHISPER_MODEL_SIZE = "small"  # tiny, base, small, medium, large-v3
+WHISPER_MODEL_SIZE = "small"
+TTS_MODEL_NAME = "tts_models/en/ljspeech/tacotron2-DDC"
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "streamlit_voice_ai_app"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -33,48 +29,46 @@ SYSTEM_PROMPT = """
 You are a helpful AI voice assistant.
 Reply clearly, naturally, and concisely.
 Keep answers easy to understand when read aloud.
-When appropriate, use short paragraphs or bullets.
 """.strip()
 
-# =====================================
-# Secrets / API Key
-# =====================================
-def get_groq_api_key() -> str | None:
+
+def get_groq_api_key():
     try:
         return st.secrets["GROQ_API_KEY"]
     except Exception:
         return os.environ.get("GROQ_API_KEY")
 
+
 GROQ_API_KEY = get_groq_api_key()
 
 if not GROQ_API_KEY:
     st.error("GROQ_API_KEY not found. Add it in Streamlit secrets.")
-    st.info(
-        "Create `.streamlit/secrets.toml` locally or add secrets in Streamlit Cloud."
-    )
     st.stop()
 
-# =====================================
-# Cached Resources
-# =====================================
-@st.cache_resource
-def load_groq_client() -> Groq:
-    return Groq(api_key=GROQ_API_KEY)
 
 @st.cache_resource
-def load_whisper_model(model_size: str) -> WhisperModel:
+def load_groq_client():
+    return Groq(api_key=GROQ_API_KEY)
+
+
+@st.cache_resource
+def load_whisper_model(model_size: str):
     return WhisperModel(
         model_size,
         device="cpu",
         compute_type="int8",
     )
 
+
+@st.cache_resource
+def load_tts_model():
+    return TTS(model_name=TTS_MODEL_NAME, progress_bar=False)
+
+
 client = load_groq_client()
 whisper_model = load_whisper_model(WHISPER_MODEL_SIZE)
+tts_model = load_tts_model()
 
-# =====================================
-# Session State
-# =====================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -84,16 +78,14 @@ if "last_transcript" not in st.session_state:
 if "last_response" not in st.session_state:
     st.session_state.last_response = ""
 
+if "last_audio_path" not in st.session_state:
+    st.session_state.last_audio_path = ""
+
 if "processing_error" not in st.session_state:
     st.session_state.processing_error = ""
 
-# =====================================
-# Helpers
-# =====================================
+
 def save_uploaded_audio(uploaded_audio) -> str:
-    """
-    Save Streamlit audio input to a temporary file.
-    """
     suffix = Path(uploaded_audio.name).suffix if uploaded_audio.name else ".wav"
     file_path = TEMP_DIR / f"{uuid.uuid4().hex}{suffix}"
 
@@ -102,10 +94,8 @@ def save_uploaded_audio(uploaded_audio) -> str:
 
     return str(file_path)
 
+
 def transcribe_audio(audio_path: str) -> str:
-    """
-    Convert speech to text using Faster-Whisper.
-    """
     segments, _ = whisper_model.transcribe(
         audio_path,
         beam_size=5,
@@ -120,10 +110,8 @@ def transcribe_audio(audio_path: str) -> str:
 
     return " ".join(transcript_parts).strip()
 
-def build_groq_messages(user_text: str) -> list[dict]:
-    """
-    Build message list for Groq chat completion using chat history.
-    """
+
+def build_groq_messages(user_text: str):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     for item in st.session_state.messages:
@@ -135,10 +123,8 @@ def build_groq_messages(user_text: str) -> list[dict]:
     messages.append({"role": "user", "content": user_text})
     return messages
 
+
 def ask_groq(user_text: str) -> str:
-    """
-    Call Groq chat completion.
-    """
     messages = build_groq_messages(user_text)
 
     chat_completion = client.chat.completions.create(
@@ -150,7 +136,17 @@ def ask_groq(user_text: str) -> str:
 
     return chat_completion.choices[0].message.content.strip()
 
-def add_user_message(text: str) -> None:
+
+def synthesize_speech(text: str) -> str:
+    output_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
+    tts_model.tts_to_file(
+        text=text,
+        file_path=str(output_path),
+    )
+    return str(output_path)
+
+
+def add_user_message(text: str):
     st.session_state.messages.append(
         {
             "role": "user",
@@ -159,7 +155,8 @@ def add_user_message(text: str) -> None:
         }
     )
 
-def add_assistant_message(text: str) -> None:
+
+def add_assistant_message(text: str):
     st.session_state.messages.append(
         {
             "role": "assistant",
@@ -168,11 +165,14 @@ def add_assistant_message(text: str) -> None:
         }
     )
 
-def clear_chat() -> None:
+
+def clear_chat():
     st.session_state.messages = []
     st.session_state.last_transcript = ""
     st.session_state.last_response = ""
+    st.session_state.last_audio_path = ""
     st.session_state.processing_error = ""
+
 
 def export_chat_as_text() -> str:
     lines = []
@@ -189,13 +189,12 @@ def export_chat_as_text() -> str:
 
     return "\n".join(lines)
 
+
 def export_chat_as_json() -> str:
     return json.dumps(st.session_state.messages, indent=2, ensure_ascii=False)
 
-def process_user_text(user_text: str) -> None:
-    """
-    Process text input through Groq and update chat.
-    """
+
+def process_user_text(user_text: str):
     cleaned = (user_text or "").strip()
     if not cleaned:
         st.warning("Please enter some text.")
@@ -203,6 +202,7 @@ def process_user_text(user_text: str) -> None:
 
     st.session_state.processing_error = ""
     st.session_state.last_transcript = cleaned
+    st.session_state.last_audio_path = ""
 
     add_user_message(cleaned)
 
@@ -212,13 +212,13 @@ def process_user_text(user_text: str) -> None:
     st.session_state.last_response = assistant_reply
     add_assistant_message(assistant_reply)
 
-def process_audio_input(uploaded_audio) -> None:
-    """
-    Process voice input:
-    1. Save audio
-    2. Transcribe with Whisper
-    3. Send transcript to Groq
-    """
+    with st.spinner("Generating voice output..."):
+        audio_path = synthesize_speech(assistant_reply)
+
+    st.session_state.last_audio_path = audio_path
+
+
+def process_audio_input(uploaded_audio):
     if uploaded_audio is None:
         st.warning("Please record audio first.")
         return
@@ -237,6 +237,7 @@ def process_audio_input(uploaded_audio) -> None:
             return
 
         st.session_state.last_transcript = transcript
+        st.session_state.last_audio_path = ""
         add_user_message(transcript)
 
         with st.spinner("Thinking with Groq..."):
@@ -245,29 +246,21 @@ def process_audio_input(uploaded_audio) -> None:
         st.session_state.last_response = assistant_reply
         add_assistant_message(assistant_reply)
 
+        with st.spinner("Generating voice output..."):
+            assistant_audio_path = synthesize_speech(assistant_reply)
+
+        st.session_state.last_audio_path = assistant_audio_path
+
     except Exception as e:
         st.session_state.processing_error = str(e)
         st.error(f"Error: {e}")
 
-# =====================================
-# Sidebar
-# =====================================
+
 with st.sidebar:
     st.header("⚙️ Settings")
     st.write(f"**Groq model:** `{GROQ_MODEL}`")
     st.write(f"**Whisper model:** `{WHISPER_MODEL_SIZE}`")
-
-    st.divider()
-
-    st.subheader("📦 Stack")
-    st.markdown(
-        """
-- **Frontend:** Streamlit  
-- **LLM:** Groq  
-- **STT:** Faster-Whisper  
-- **TTS:** Not enabled in this stable cloud version
-        """
-    )
+    st.write(f"**TTS model:** `{TTS_MODEL_NAME}`")
 
     st.divider()
 
@@ -277,12 +270,9 @@ with st.sidebar:
 
     st.divider()
 
-    txt_export = export_chat_as_text()
-    json_export = export_chat_as_json()
-
     st.download_button(
         label="⬇️ Download Chat (.txt)",
-        data=txt_export,
+        data=export_chat_as_text(),
         file_name="chat_export.txt",
         mime="text/plain",
         use_container_width=True,
@@ -290,15 +280,12 @@ with st.sidebar:
 
     st.download_button(
         label="⬇️ Download Chat (.json)",
-        data=json_export,
+        data=export_chat_as_json(),
         file_name="chat_export.json",
         mime="application/json",
         use_container_width=True,
     )
 
-# =====================================
-# Main UI
-# =====================================
 st.title(APP_TITLE)
 st.caption(APP_SUBTITLE)
 
@@ -308,7 +295,7 @@ with tab1:
     st.subheader("Speak to the assistant")
     audio_file = st.audio_input("Record your question")
 
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns(2)
 
     with col1:
         if st.button("Process Voice", use_container_width=True):
@@ -329,31 +316,37 @@ with tab2:
     if st.button("Send Text", use_container_width=True):
         process_user_text(text_input)
 
-# =====================================
-# Last Interaction Summary
-# =====================================
 st.divider()
 st.subheader("Latest Result")
 
-result_col1, result_col2 = st.columns(2)
+col1, col2 = st.columns(2)
 
-with result_col1:
+with col1:
     st.markdown("**Last Transcript / User Input**")
     if st.session_state.last_transcript:
         st.write(st.session_state.last_transcript)
     else:
         st.caption("No input processed yet.")
 
-with result_col2:
+with col2:
     st.markdown("**Last Assistant Response**")
     if st.session_state.last_response:
         st.write(st.session_state.last_response)
     else:
         st.caption("No response generated yet.")
 
-# =====================================
-# Chat UI
-# =====================================
+if st.session_state.last_audio_path:
+    st.subheader("🔊 Voice Output")
+    st.audio(st.session_state.last_audio_path)
+
+    with open(st.session_state.last_audio_path, "rb") as f:
+        st.download_button(
+            label="⬇️ Download Voice Reply",
+            data=f,
+            file_name="assistant_reply.wav",
+            mime="audio/wav",
+        )
+
 st.divider()
 st.subheader("Conversation")
 
@@ -361,20 +354,6 @@ if not st.session_state.messages:
     st.info("No messages yet. Use voice input or text input to start chatting.")
 else:
     for msg in st.session_state.messages:
-        role = msg.get("role", "assistant")
-        content = msg.get("content", "")
-        time = msg.get("time", "")
-
-        with st.chat_message(role):
-            st.markdown(content)
-            if time:
-                st.caption(time)
-
-# =====================================
-# Footer
-# =====================================
-st.divider()
-st.caption(
-    "Built with Streamlit, Groq, and Faster-Whisper. "
-    "This cloud-safe version skips TTS for deployment stability."
-)
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            st.caption(msg["time"])
